@@ -11,8 +11,10 @@ from app.api.dependencies import get_current_user
 from app.core.config import (
     CHAT_EXTERNAL_CHANNEL,
     CHAT_EXTERNAL_MODEL,
+    CHAT_EXTERNAL_URL,
     CHAT_EXTERNAL_STREAM_URL,
     CHAT_EXTERNAL_TIMEOUT,
+    CHAT_EXTERNAL_USE_STREAM,
     LLM_MODEL,
 )
 from app.core.database import conversations_collection
@@ -112,6 +114,8 @@ def build_external_payload(messages: list[dict[str, str]]) -> dict[str, Any]:
 
 
 async def stream_external_events(payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+    if not CHAT_EXTERNAL_STREAM_URL:
+        raise ValueError("CHAT_EXTERNAL_STREAM_URL is not configured")
     timeout = httpx.Timeout(CHAT_EXTERNAL_TIMEOUT)
     headers = {
         "accept": "application/json",
@@ -134,6 +138,41 @@ async def stream_external_events(payload: dict[str, Any]) -> AsyncIterator[dict[
                     yield event
 
 
+async def call_external_non_stream(payload: dict[str, Any]) -> str:
+    if not CHAT_EXTERNAL_URL:
+        raise ValueError("CHAT_EXTERNAL_URL is not configured")
+    timeout = httpx.Timeout(CHAT_EXTERNAL_TIMEOUT)
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            CHAT_EXTERNAL_URL,
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    if not isinstance(data, dict):
+        return ""
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    return ""
+
+
+def chunk_text(text: str, size: int = 30) -> list[str]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    return [stripped[idx : idx + size] for idx in range(0, len(stripped), size)]
+
+
 @router.post("/")
 async def chat(payload: ChatRequest, current_user: dict = Depends(get_current_user)):
     if not payload.message.strip():
@@ -151,20 +190,26 @@ async def chat(payload: ChatRequest, current_user: dict = Depends(get_current_us
         content_parts: list[str] = []
         final_content = ""
         try:
-            async for event in stream_external_events(external_payload):
-                event_type = event.get("type")
-                if event_type == "token":
-                    content = event.get("content", "")
-                    if content:
-                        content_parts.append(content)
-                        yield format_sse({"type": "delta", "content": content})
-                elif event_type == "done":
-                    final_message = event.get("message") or {}
-                    done_content = final_message.get("content", "")
-                    if done_content:
-                        final_content = done_content.strip()
+            if CHAT_EXTERNAL_USE_STREAM:
+                async for event in stream_external_events(external_payload):
+                    event_type = event.get("type")
+                    if event_type == "token":
+                        content = event.get("content", "")
+                        if content:
+                            content_parts.append(content)
+                            yield format_sse({"type": "delta", "content": content})
+                    elif event_type == "done":
+                        final_message = event.get("message") or {}
+                        done_content = final_message.get("content", "")
+                        if done_content:
+                            final_content = done_content.strip()
+            else:
+                final_content = await call_external_non_stream(external_payload)
+                for chunk in chunk_text(final_content):
+                    content_parts.append(chunk)
+                    yield format_sse({"type": "delta", "content": chunk})
         except Exception as exc:
-            yield format_sse({"type": "error", "message": f"External stream error: {exc}"})
+            yield format_sse({"type": "error", "message": f"External chat error: {exc}"})
             return
 
         assistant_text = final_content or "".join(content_parts).strip()
@@ -191,17 +236,20 @@ async def chat(payload: ChatRequest, current_user: dict = Depends(get_current_us
     content_parts: list[str] = []
     final_content = ""
     try:
-        async for event in stream_external_events(external_payload):
-            event_type = event.get("type")
-            if event_type == "token":
-                content = event.get("content", "")
-                if content:
-                    content_parts.append(content)
-            elif event_type == "done":
-                final_message = event.get("message") or {}
-                done_content = final_message.get("content", "")
-                if done_content:
-                    final_content = done_content.strip()
+        if CHAT_EXTERNAL_USE_STREAM:
+            async for event in stream_external_events(external_payload):
+                event_type = event.get("type")
+                if event_type == "token":
+                    content = event.get("content", "")
+                    if content:
+                        content_parts.append(content)
+                elif event_type == "done":
+                    final_message = event.get("message") or {}
+                    done_content = final_message.get("content", "")
+                    if done_content:
+                        final_content = done_content.strip()
+        else:
+            final_content = await call_external_non_stream(external_payload)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
