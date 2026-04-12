@@ -1,4 +1,5 @@
 import json
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -166,7 +167,7 @@ async def call_external_non_stream(payload: dict[str, Any]) -> str:
     return ""
 
 
-def chunk_text(text: str, size: int = 30) -> list[str]:
+def chunk_text(text: str, size: int = 10) -> list[str]:
     stripped = text.strip()
     if not stripped:
         return []
@@ -208,6 +209,7 @@ async def chat(payload: ChatRequest, current_user: dict = Depends(get_current_us
                 for chunk in chunk_text(final_content):
                     content_parts.append(chunk)
                     yield format_sse({"type": "delta", "content": chunk})
+                    await asyncio.sleep(0.5)
         except Exception as exc:
             yield format_sse({"type": "error", "message": f"External chat error: {exc}"})
             return
