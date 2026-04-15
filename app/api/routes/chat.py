@@ -209,7 +209,7 @@ async def chat(payload: ChatRequest, current_user: dict = Depends(get_current_us
                 for chunk in chunk_text(final_content):
                     content_parts.append(chunk)
                     yield format_sse({"type": "delta", "content": chunk})
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.1)
         except Exception as exc:
             yield format_sse({"type": "error", "message": f"External chat error: {exc}"})
             return
